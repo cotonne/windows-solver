@@ -9,8 +9,14 @@ Help solving CTF machines
  - [x] Search for credentials in file
  - [x] Search for credentials in Groups.xml
  - [x] Search for Service Principal Names in LDAP / Kerberoasting
- - [ ] Retry all actions for every new creds
+ - [x] Retry all actions for every new creds
+ - [ ] Try to connect to WinRM
+ - [ ] Try to connect to SMBEXEC
+ - [ ] Try to connect to MSSQL if available
+ - [ ] Perform Pass The Hash
  - [ ] Search for users and save them into users.txt
  - [ ] Search for passwords and save them into passwords.txt
  - [ ] Search for pre-auth users / AS-REP roasting
  - [ ] Try to crack hashes
+ - [ ] Pass "-nopass" when password is empty
+
