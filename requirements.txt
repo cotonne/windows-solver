@@ -6,3 +6,6 @@ defusedxml
 ldap3
 python-magic
 pywinrm
+english-words
+nltk
+python3-nmap

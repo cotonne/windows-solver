@@ -10,6 +10,7 @@ Help solving CTF machines
  - [x] Search for credentials in Groups.xml
  - [x] Search for Service Principal Names in LDAP / Kerberoasting
  - [x] Retry all actions for every new creds
+ - [x] Pass "-nopass" when password is empty
  - [ ] Try to connect to WinRM
  - [ ] Try to connect to SMBEXEC
  - [ ] Try to connect to MSSQL if available
@@ -18,5 +19,6 @@ Help solving CTF machines
  - [ ] Search for passwords and save them into passwords.txt
  - [ ] Search for pre-auth users / AS-REP roasting
  - [ ] Try to crack hashes
- - [ ] Pass "-nopass" when password is empty
-
+ - Extract passwords from files
+   * [x] pdf
+   * [x] Policy Groups
