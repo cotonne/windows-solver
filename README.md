@@ -19,6 +19,7 @@ Help solving CTF machines
  - [ ] Search for passwords and save them into passwords.txt
  - [ ] Search for pre-auth users / AS-REP roasting
  - [ ] Try to crack hashes
+ - [ ] Trusted delegation
  - Extract passwords from files
    * [x] pdf
    * [x] Policy Groups

@@ -4,6 +4,7 @@ import argparse
 from io import BytesIO
 from os import path, mkdir, path, remove
 import subprocess
+import csv
 
 from impacket.smbconnection import SMBConnection, SessionError
 from tempfile import mkdtemp, mkstemp, gettempdir
@@ -53,7 +54,7 @@ parser = argparse.ArgumentParser(prog='WindowsSolver')
 parser.add_argument('--ip', help='target IP', required=True)
 parser.add_argument('--usernames', help='File with initial list of usernames')
 parser.add_argument('--passwords', help='File with initial list of passwords')
-parser.add_argument('--credentials', help='File with initial list of credentials, format "username:password"')
+parser.add_argument('--credentials', help='File with initial list of credentials, format "username:password"', type=argparse.FileType('r', encoding='utf-8'))
 parser.add_argument('--credential', help='Initial credential, format "username:password"')
 
 hash_file_name = path.join(gettempdir(), "hash.txt")
@@ -309,6 +310,11 @@ def scan_ports(ip):
 if __name__ =="__main__":
     args = parser.parse_args()
     ip = args.ip
+
+    if args.credentials is not None:
+        csv_file = csv.reader(args.credentials, delimiter=":")
+        for line in csv_file:
+            save_creds(line[0], line[1])
 
     if args.credential is not None and ":" in args.credential:
         username = args.credential.split(":")[0]
